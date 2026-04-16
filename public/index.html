@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rhinestonify — Rhinestone Template Generator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <div class="header-inner">
+        <div class="logo">
+          <span class="logo-icon">💎</span>
+          <span class="logo-text">Rhinestonify</span>
+        </div>
+        <span class="header-sub">Rhinestone SVG cutfile generator</span>
+      </div>
+    </header>
+
+    <main class="main-layout">
+      <!-- ── LEFT PANEL ── -->
+      <div class="settings-panel">
+
+        <!-- Step 1: Image -->
+        <section class="card">
+          <div class="step-label">1 — Upload image</div>
+          <div class="upload-zone" id="uploadZone">
+            <input type="file" id="fileInput" accept="image/*" hidden>
+            <div class="upload-inner" id="uploadInner" onclick="document.getElementById('fileInput').click()">
+              <div class="upload-icon">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                  <polyline points="17 8 12 3 7 8"/>
+                  <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+              </div>
+              <p class="upload-label">Click or drag & drop</p>
+              <p class="upload-sub">PNG, JPG, SVG — high contrast works best</p>
+            </div>
+          </div>
+          <div class="thumb-wrap" id="thumbWrap" style="display:none">
+            <img id="thumbImg" src="" alt="preview">
+            <button class="change-btn" onclick="resetImage()">Change image</button>
+          </div>
+          <!-- Gemini analysis result -->
+          <div class="analysis-box" id="analysisBox" style="display:none">
+            <div class="analysis-label">AI analysis</div>
+            <div class="analysis-text" id="analysisText">—</div>
+          </div>
+        </section>
+
+        <!-- Step 2: Colors -->
+        <section class="card">
+          <div class="step-label">2 — Stone colors</div>
+          <div class="chip-row">
+            <button class="chip active" onclick="setColors(1, this)">1 color</button>
+            <button class="chip" onclick="setColors(2, this)">2 colors</button>
+            <button class="chip" onclick="setColors(3, this)">3 colors</button>
+          </div>
+        </section>
+
+        <!-- Step 3: Stone size -->
+        <section class="card">
+          <div class="step-label">3 — Stone size</div>
+          <div class="mode-row">
+            <button class="mode-btn active" id="modeAuto" onclick="setMode('auto')">Auto</button>
+            <button class="mode-btn" id="modeMulti" onclick="setMode('multi')">Multi-size</button>
+            <button class="mode-btn" id="modeManual" onclick="setMode('manual')">Manual</button>
+          </div>
+          <p class="mode-note" id="modeNote">Best stone size selected automatically for your design width.</p>
+          <div id="manualPicker" style="display:none; margin-top:10px">
+            <div class="chip-row" id="ssChips">
+              <button class="chip active" onclick="setSS('SS6',this)">SS6<span class="chip-sub">1.9–2.1mm</span></button>
+              <button class="chip" onclick="setSS('SS10',this)">SS10<span class="chip-sub">2.7–2.9mm</span></button>
+              <button class="chip" onclick="setSS('SS12',this)">SS12<span class="chip-sub">3.0–3.2mm</span></button>
+              <button class="chip" onclick="setSS('SS16',this)">SS16<span class="chip-sub">3.8–4.0mm</span></button>
+              <button class="chip" onclick="setSS('SS20',this)">SS20<span class="chip-sub">4.6–4.8mm</span></button>
+            </div>
+          </div>
+        </section>
+
+        <!-- Step 4: Dimensions -->
+        <section class="card">
+          <div class="step-label">4 — Design width</div>
+          <div class="dim-row">
+            <label>Width (mm)</label>
+            <input type="number" id="targetWidth" value="100" min="20" max="400" step="1" oninput="scheduleUpdate()">
+          </div>
+          <div class="ss-preview" id="ssPreview"></div>
+        </section>
+
+        <!-- Step 5: Thresholds -->
+        <section class="card">
+          <div class="step-label">5 — Fine-tune</div>
+          <div class="slider-group">
+            <div class="slider-row">
+              <label>Darkness threshold</label>
+              <input type="range" id="thrSlider" min="40" max="230" value="160" step="1"
+                oninput="document.getElementById('thrVal').textContent=this.value; scheduleUpdate()">
+              <span class="slider-val" id="thrVal">160</span>
+            </div>
+            <div class="slider-row">
+              <label>Min fill % per stone</label>
+              <input type="range" id="minFill" min="5" max="60" value="20" step="1"
+                oninput="document.getElementById('fillVal').textContent=this.value+'%'; scheduleUpdate()">
+              <span class="slider-val" id="fillVal">20%</span>
+            </div>
+          </div>
+          <label class="invert-label">
+            <input type="checkbox" id="invertChk" onchange="scheduleUpdate()">
+            Invert fill (place stones on light regions)
+          </label>
+        </section>
+
+        <button class="generate-btn" id="generateBtn" onclick="generate()">
+          <span class="btn-spinner" id="btnSpinner"></span>
+          <span id="btnLabel">Generate template</span>
+        </button>
+
+      </div>
+
+      <!-- ── RIGHT PANEL: PREVIEW ── -->
+      <div class="preview-panel">
+        <div class="preview-header">
+          <span class="preview-title">Live preview</span>
+          <span class="preview-status" id="previewStatus"></span>
+        </div>
+
+        <div class="canvas-wrap" id="canvasWrap">
+          <div class="canvas-empty" id="canvasEmpty">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity=".3">
+              <rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/>
+              <polyline points="21 15 16 10 5 21"/>
+            </svg>
+            <p>Upload an image to begin</p>
+          </div>
+          <canvas id="previewCanvas" style="display:none"></canvas>
+        </div>
+
+        <!-- Legend -->
+        <div class="legend-wrap" id="legendWrap" style="display:none">
+          <div id="colorRows"></div>
+          <div class="total-row">
+            <span>Total rhinestones</span>
+            <span id="totalCount">—</span>
+          </div>
+        </div>
+
+        <!-- Stats -->
+        <div class="stats-grid" id="statsGrid" style="display:none">
+          <div class="stat-card">
+            <div class="stat-val" id="statAcross">—</div>
+            <div class="stat-lbl">stones across</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" id="statDensity">—</div>
+            <div class="stat-lbl">per sq inch</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-val" id="statSS">—</div>
+            <div class="stat-lbl">primary size</div>
+          </div>
+        </div>
+
+        <!-- Download -->
+        <button class="download-btn" id="downloadBtn" style="display:none" onclick="downloadSVG()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          Download cutfile (.svg)
+        </button>
+        <p class="download-note" id="downloadNote" style="display:none">
+          Ready for Cricut, Silhouette, or any vinyl cutter
+        </p>
+      </div>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
