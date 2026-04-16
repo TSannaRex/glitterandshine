@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: rhinestonify
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false        # Set manually in Render dashboard
+      - key: NODE_ENV
+        value: production
