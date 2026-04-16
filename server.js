@@ -16,9 +16,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    file.mimetype.startsWith('image/') ? cb(null, true) : cb(new Error('Images only'));
-  }
+  fileFilter: (req, file, cb) =>
+    file.mimetype.startsWith('image/') ? cb(null, true) : cb(new Error('Images only'))
 });
 
 // ── SS SIZE TABLE ─────────────────────────────────────────────────────────────
@@ -32,67 +31,48 @@ const SS_TABLE = [
 ];
 function midMm(s) { return (s.lo + s.hi) / 2; }
 
-// ── ATTEMPT TO REPAIR TRUNCATED JSON ─────────────────────────────────────────
-// If Gemini cuts off mid-stream we get incomplete JSON.
-// Strategy: truncate to last complete region object we can find.
-function repairJSON(raw) {
-  // First try straight parse
-  try { return JSON.parse(raw); } catch(_) {}
-
-  // Strip markdown fences
-  let s = raw.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/```\s*$/i,'').trim();
-  try { return JSON.parse(s); } catch(_) {}
-
-  // Find last complete closing brace for a region polygon block
-  // Walk backwards looking for a valid cut-point
-  const attempts = [
-    // Try closing the polygons array and region, then wrap up
-    s + ']}]}',
-    s + ']}]},"recommended_ss":"SS12","recommended_threshold":140,"has_thin_strokes":false,"notes":"Auto-completed"}',
-    // Maybe we're inside a points array
-    s + ']]}}]}]},"recommended_ss":"SS12","recommended_threshold":140,"has_thin_strokes":false,"notes":"Auto-completed"}',
-  ];
-
-  for (const attempt of attempts) {
-    try { return JSON.parse(attempt); } catch(_) {}
-  }
-
-  // Last resort: find last complete region block by regex
-  const regionMatches = [...s.matchAll(/"id"\s*:\s*\d+[\s\S]*?"polygons"\s*:\s*\[[\s\S]*?\]\s*\}/g)];
-  if (regionMatches.length > 0) {
-    const lastGoodIdx = regionMatches[regionMatches.length - 1].index + regionMatches[regionMatches.length - 1][0].length;
-    const trimmed = s.slice(0, lastGoodIdx);
-    const wrapped = `{"regions":[${trimmed}],"recommended_ss":"SS12","recommended_threshold":140,"has_thin_strokes":false,"notes":"Partial trace"}`;
-    try { return JSON.parse(wrapped); } catch(_) {}
-  }
-
-  throw new Error('Could not repair truncated JSON from Gemini');
-}
-
-// ── GEMINI: trace shapes as normalised polygons ───────────────────────────────
-async function traceShapes(imageBase64, mimeType, numColors, widthMm) {
+// ── GEMINI: get a compact grid mask + metadata only ───────────────────────────
+// Instead of asking for polygon coordinates (long output), we ask Gemini for:
+//   1. A small ASCII grid (e.g. 40x40) of 0/1 per cell — very compact
+//   2. Recommended SS size and threshold
+// The grid tells us which stone positions are inside the design.
+async function getGridMask(imageBase64, mimeType, numColors, widthMm, gridCols, gridRows) {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not set');
 
-  const colorDesc = numColors === 1
-    ? 'one region for the entire foreground design'
-    : `${numColors} regions, darkest first (id 0) to lightest (id ${numColors - 1})`;
+  const prompt = `You are analyzing an image for rhinestone template generation.
 
-  // Key change: ask for MAX 32 points per polygon to avoid token overflow
-  const prompt = `You are a silhouette-tracing assistant for a rhinestone template generator.
+The image contains a design on a plain background.
 
-Trace the outline of ${colorDesc} in this image.
+YOUR TASK: Output a ${gridCols}x${gridRows} binary grid representing which cells contain the FOREGROUND design (not background).
 
-STRICT RULES:
-- Coordinates are NORMALISED: 0.0=top-left, 1.0=bottom-right of the image.
-- Use MAXIMUM 32 points per polygon. Fewer is better. Capture the overall shape, not every pixel.
-- Close each polygon: last point must equal first point.
-- Separate disconnected parts into separate polygon objects.
-- Do NOT trace the background or white space.
-- recommended_ss: best stone size from [SS6,SS10,SS12,SS16,SS20,SS30] for a ${widthMm}mm wide design. Use SS6-SS12 for detailed/curved designs, SS16-SS30 only for bold designs over 150mm.
-- recommended_threshold: grayscale 0-255 where pixels below = foreground.
+Grid rules:
+- Output exactly ${gridRows} rows, each with exactly ${gridCols} characters
+- Use '1' for cells that are part of the foreground design
+- Use '0' for cells that are background/empty
+- Row 0 is the TOP of the image, row ${gridRows-1} is the BOTTOM
+- Col 0 is the LEFT, col ${gridCols-1} is the RIGHT
+- Be precise — follow the actual shape outline carefully
+- For the CF logo: fill the C letter shape solidly, and mark the circuit board elements
 
-RESPOND WITH ONLY THIS JSON (no markdown, no extra text):
-{"regions":[{"id":0,"color_description":"dark shape","polygons":[{"points":[[0.1,0.1],[0.5,0.05],[0.9,0.1],[0.9,0.9],[0.1,0.9],[0.1,0.1]]}]}],"recommended_ss":"SS12","recommended_threshold":140,"has_thin_strokes":false,"notes":"one sentence description"}`;
+${numColors > 1 ? `Also output a COLOR grid using digits 1-${numColors} instead of just 0/1, where 0=background, 1=darkest region, ${numColors}=lightest region.` : ''}
+
+Also provide:
+- recommended_ss: best stone size from [SS6,SS10,SS12,SS16,SS20,SS30] for ${widthMm}mm wide design
+- recommended_threshold: grayscale 0-255
+- has_thin_strokes: true/false
+- notes: brief description
+
+Respond with ONLY this JSON (no markdown):
+{
+  "grid": "0000011111100000\\n0001111111110000\\n...",
+  "recommended_ss": "SS12",
+  "recommended_threshold": 140,
+  "has_thin_strokes": false,
+  "notes": "solid C shape with circuit elements"
+}
+
+The grid field is a single string with rows separated by \\n characters.
+Each row must be exactly ${gridCols} characters of 0s and 1s.`;
 
   const resp = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${GEMINI_API_KEY}`,
@@ -104,11 +84,7 @@ RESPOND WITH ONLY THIS JSON (no markdown, no extra text):
           { inline_data: { mime_type: mimeType, data: imageBase64 } },
           { text: prompt }
         ]}],
-        generationConfig: {
-          temperature: 0.05,
-          maxOutputTokens: 4096,
-          responseMimeType: 'application/json'  // force JSON mode
-        }
+        generationConfig: { temperature: 0.05, maxOutputTokens: 4096 }
       })
     }
   );
@@ -118,86 +94,108 @@ RESPOND WITH ONLY THIS JSON (no markdown, no extra text):
   const data = await resp.json();
   const raw  = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 
-  console.log('Gemini raw response length:', raw.length);
-  console.log('Gemini raw preview:', raw.slice(0, 300));
+  console.log('Gemini raw length:', raw.length);
+  console.log('Gemini preview:', raw.slice(0, 200));
+
+  // Strip markdown fences
+  const cleaned = raw
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim();
 
   let parsed;
   try {
-    parsed = repairJSON(raw);
+    parsed = JSON.parse(cleaned);
   } catch(e) {
-    console.error('Full raw response:\n', raw);
-    throw new Error('Gemini returned unparseable JSON: ' + e.message);
+    // Try to extract just the fields we need with regex
+    console.error('JSON parse failed, attempting field extraction. Raw:', raw.slice(0, 500));
+
+    const gridMatch    = raw.match(/"grid"\s*:\s*"([^"]+)"/);
+    const ssMatch      = raw.match(/"recommended_ss"\s*:\s*"([^"]+)"/);
+    const thrMatch     = raw.match(/"recommended_threshold"\s*:\s*(\d+)/);
+    const thinMatch    = raw.match(/"has_thin_strokes"\s*:\s*(true|false)/);
+    const notesMatch   = raw.match(/"notes"\s*:\s*"([^"]+)"/);
+
+    if (!gridMatch) throw new Error('Could not extract grid from Gemini response');
+
+    parsed = {
+      grid: gridMatch[1].replace(/\\n/g, '\n'),
+      recommended_ss: ssMatch?.[1] || 'SS12',
+      recommended_threshold: thrMatch ? parseInt(thrMatch[1]) : 140,
+      has_thin_strokes: thinMatch?.[1] === 'true',
+      notes: notesMatch?.[1] || ''
+    };
   }
 
-  // Validate
-  if (!Array.isArray(parsed.regions) || parsed.regions.length === 0) {
-    throw new Error('Gemini returned no regions');
+  // Normalise grid string
+  if (typeof parsed.grid === 'string') {
+    parsed.grid = parsed.grid.replace(/\\n/g, '\n');
   }
-  for (const r of parsed.regions) {
-    if (!Array.isArray(r.polygons)) r.polygons = [];
-    r.polygons = r.polygons.filter(p => Array.isArray(p.points) && p.points.length >= 3);
-  }
-  // Remove regions with no valid polygons
-  parsed.regions = parsed.regions.filter(r => r.polygons.length > 0);
-  if (parsed.regions.length === 0) throw new Error('No valid polygons after validation');
 
-  return parsed;
+  // Parse grid into 2D boolean array
+  const rows = parsed.grid.split('\n').map(r => r.trim()).filter(r => r.length > 0);
+  if (rows.length === 0) throw new Error('Gemini returned empty grid');
+
+  // Build mask array [row][col] = regionId (0=background, 1+= foreground)
+  const mask = [];
+  for (let r = 0; r < gridRows; r++) {
+    mask.push([]);
+    const rowStr = rows[r] || '';
+    for (let c = 0; c < gridCols; c++) {
+      const ch = rowStr[c] || '0';
+      mask[r].push(ch === '0' ? 0 : parseInt(ch) || 1);
+    }
+  }
+
+  return {
+    mask,
+    recommended_ss: parsed.recommended_ss || 'SS12',
+    recommended_threshold: parsed.recommended_threshold || 140,
+    has_thin_strokes: parsed.has_thin_strokes || false,
+    notes: parsed.notes || ''
+  };
 }
 
-// ── RAY-CAST POINT-IN-POLYGON ─────────────────────────────────────────────────
-function raycast(px, py, pts) {
-  let inside = false;
-  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
-    const [xi, yi] = pts[i], [xj, yj] = pts[j];
-    if (((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi))
-      inside = !inside;
-  }
-  return inside;
-}
+// ── STONE GRID from mask ──────────────────────────────────────────────────────
+function buildStoneGrid(maskResult, wMm, hMm, primarySS, invert) {
+  const { mask } = maskResult;
+  const gridRows = mask.length;
+  const gridCols = mask[0]?.length || 0;
+  if (gridCols === 0) throw new Error('Empty mask');
 
-// ── STONE GRID ────────────────────────────────────────────────────────────────
-function buildStoneGrid(traceResult, wMm, hMm, primarySS, invert) {
   const pitch  = primarySS.pitch;
   const stoneR = midMm(primarySS) / 2;
   const cols   = Math.floor(wMm / pitch);
   const rows   = Math.floor(hMm / pitch);
 
-  // Convert normalised coords → mm
-  const shapes = [];
-  for (const region of traceResult.regions) {
-    for (const poly of region.polygons) {
-      shapes.push({
-        regionId: region.id,
-        pts: poly.points.map(([nx, ny]) => [
-          Math.max(0, Math.min(1, nx)) * wMm,
-          Math.max(0, Math.min(1, ny)) * hMm
-        ])
-      });
-    }
-  }
-
   const circles = [];
+
   for (let row = 0; row < rows; row++) {
     const hex     = row % 2 === 1;
     const colsRow = hex ? cols - 1 : cols;
+
     for (let col = 0; col < colsRow; col++) {
       const cx = (hex ? pitch * 0.5 : 0) + (col + 0.5) * pitch;
       const cy = (row + 0.5) * pitch;
-      let hitRegion = -1;
-      for (const s of shapes) {
-        if (raycast(cx, cy, s.pts)) { hitRegion = s.regionId; break; }
-      }
-      const inside = hitRegion >= 0;
+
+      // Map stone position to mask cell
+      const mx = Math.min(gridCols - 1, Math.floor((cx / wMm) * gridCols));
+      const my = Math.min(gridRows - 1, Math.floor((cy / hMm) * gridRows));
+      const cellVal = mask[my][mx];
+
+      const inside = cellVal > 0;
       if (invert ? !inside : inside) {
         circles.push({
           x:  parseFloat(cx.toFixed(3)),
           y:  parseFloat(cy.toFixed(3)),
           r:  parseFloat((stoneR * 0.88).toFixed(3)),
-          ci: Math.max(0, hitRegion)
+          ci: Math.max(0, cellVal - 1)  // 0-indexed colour
         });
       }
     }
   }
+
   return circles;
 }
 
@@ -214,12 +212,20 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
     const aspect     = parseFloat(req.body.aspectRatio)   || 1;
     const hMm        = Math.round(wMm * aspect);
 
-    // Trace
-    let trace;
+    // Grid resolution: ~1 cell per 2.5mm gives good detail without huge output
+    const gridCols = Math.min(60, Math.max(20, Math.floor(wMm / 2.5)));
+    const gridRows = Math.min(60, Math.max(20, Math.floor(hMm / 2.5)));
+
+    // Get Gemini grid mask
+    let maskResult;
     try {
-      trace = await traceShapes(req.file.buffer.toString('base64'), req.file.mimetype, numColors, wMm);
+      maskResult = await getGridMask(
+        req.file.buffer.toString('base64'),
+        req.file.mimetype,
+        numColors, wMm, gridCols, gridRows
+      );
     } catch(e) {
-      console.error('Trace error:', e.message);
+      console.error('Mask error:', e.message);
       return res.status(500).json({ error: e.message, geminiError: true });
     }
 
@@ -228,11 +234,11 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
     if (sizingMode === 'manual') {
       primarySS = SS_TABLE.find(s => s.n === manualSS) || SS_TABLE[2];
     } else {
-      primarySS = SS_TABLE.find(s => s.n === trace.recommended_ss) || SS_TABLE[2];
+      primarySS = SS_TABLE.find(s => s.n === maskResult.recommended_ss) || SS_TABLE[2];
     }
 
     // Place stones
-    const circles = buildStoneGrid(trace, wMm, hMm, primarySS, invert);
+    const circles = buildStoneGrid(maskResult, wMm, hMm, primarySS, invert);
 
     const regionCounts = {};
     circles.forEach(c => { regionCounts[c.ci] = (regionCounts[c.ci] || 0) + 1; });
@@ -246,12 +252,12 @@ app.post('/api/generate', upload.single('image'), async (req, res) => {
         targetWidthMm:      wMm,
         targetHeightMm:     hMm,
         numColors,
-        geminiNotes:        trace.notes || '',
-        regionDescriptions: trace.regions.map(r => r.color_description || `Region ${r.id}`),
+        geminiNotes:        maskResult.notes,
+        regionDescriptions: Array.from({ length: numColors }, (_, i) => `Color ${i + 1}`),
         regionCounts,
         totalStones:        circles.length,
         cols:               Math.floor(wMm / primarySS.pitch),
-        hasThinStrokes:     trace.has_thin_strokes || false
+        hasThinStrokes:     maskResult.has_thin_strokes
       }
     });
 
@@ -266,5 +272,5 @@ app.get('/api/health', (_req, res) =>
 );
 
 app.listen(PORT, () =>
-  console.log(`Rhinestonify v2.1 on :${PORT} | Gemini: ${GEMINI_API_KEY ? 'ready' : 'MISSING KEY'}`)
+  console.log(`Rhinestonify v3 on :${PORT} | Gemini: ${GEMINI_API_KEY ? 'ready' : 'MISSING KEY'}`)
 );
